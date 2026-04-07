@@ -7,6 +7,8 @@ import os
 import cv2
 import numpy as np
 from datetime import datetime
+import logging
+from logger import get_logger
 
 
 class MotionDetector:
@@ -16,7 +18,7 @@ class MotionDetector:
                  stable_frames: int = 2, save_screenshot: bool = True):
         """
         初始化运动检测器
-        
+
         Args:
             threshold: 像素差异阈值，默认 1000
             min_contour_area: 最小轮廓面积比例，默认 0.001（0.1%）
@@ -27,28 +29,30 @@ class MotionDetector:
         self.min_contour_area = min_contour_area
         self.stable_frames = stable_frames
         self.save_screenshot = save_screenshot
-        
+
         # 背景减除器
         self.bg_subtractor = cv2.createBackgroundSubtractorMOG2(
             history=300, varThreshold=20, detectShadows=False
         )
-        
+
         # 上一帧
         self.last_frame = None
-        
+
         # 截图目录
         self.screenshot_dir = 'screenshot'
+        self.logger = get_logger(__name__)
+
         if self.save_screenshot and not os.path.exists(self.screenshot_dir):
             os.makedirs(self.screenshot_dir)
-            print(f"📁 已创建截图目录：{os.path.abspath(self.screenshot_dir)}")
+            self.logger.info(f"📁 已创建截图目录: {os.path.abspath(self.screenshot_dir)}")
 
     def detect(self, frame) -> tuple:
         """
         检测运动
-        
+
         Args:
             frame: 输入帧
-            
+
         Returns:
             tuple: (is_motion, motion_ratio, diff_pixels)
                 - is_motion: 是否检测到运动
@@ -92,13 +96,13 @@ class MotionDetector:
             return len(significant) > 0, motion_ratio, diff_pixels
 
         except Exception as e:
-            print(f"⚠️ 运动检测异常：{e}")
+            self.logger.error(f"运动检测异常: {e}", exc_info=True)
             return False, 0.0, 0
 
     def update_last_frame(self, frame):
         """
         更新上一帧
-        
+
         Args:
             frame: 当前帧
         """
@@ -108,7 +112,7 @@ class MotionDetector:
     def save_screenshot_file(self, frame: np.ndarray, diff_pixels: int, count: int):
         """
         保存变化截图
-        
+
         Args:
             frame: 帧图像
             diff_pixels: 差异像素数
@@ -119,7 +123,7 @@ class MotionDetector:
             hour_dir = os.path.join(self.screenshot_dir, current_hour)
             if not os.path.exists(hour_dir):
                 os.makedirs(hour_dir)
-                print(f"   📁 创建目录：{os.path.abspath(hour_dir)}")
+                self.logger.info(f"📁 创建目录: {os.path.abspath(hour_dir)}")
 
             timestamp = datetime.now().strftime("%M_%S_%f")[:-3]
             filename = f"{timestamp}_diff_{diff_pixels}_#{count}.jpg"
@@ -128,25 +132,25 @@ class MotionDetector:
             # 复制帧避免影响原始数据
             frame_copy = frame.copy()
             success = cv2.imwrite(filepath, frame_copy, [cv2.IMWRITE_JPEG_QUALITY, 90])
-            
+
             if success:
                 abs_path = os.path.abspath(filepath)
-                print(f"   📸 已保存截图：{filename}")
-                print(f"      路径：{abs_path}")
+                self.logger.info(f"📸 已保存截图: {filename}")
+                self.logger.debug(f"路径: {abs_path}")
             else:
-                print(f"   ❌ 保存失败：{filename}")
+                self.logger.error(f"❌ 保存失败: {filename}")
         except Exception as e:
-            print(f"   ❌ 保存截图异常：{e}")
+            self.logger.error(f"保存截图异常: {e}", exc_info=True)
 
     def warmup(self, get_frame_func, frames_count: int = 10):
         """
         预热背景模型
-        
+
         Args:
             get_frame_func: 获取帧的函数
             frames_count: 预热的帧数，默认 10
         """
-        print(f"🔥 正在预热，跳过前 {frames_count} 帧...")
+        self.logger.info(f"正在预热，跳过前 {frames_count} 帧...")
         for i in range(frames_count):
             ret, frame = get_frame_func()
             if ret:
@@ -154,4 +158,4 @@ class MotionDetector:
                 gray = cv2.GaussianBlur(gray, (21, 21), 0)
                 self.bg_subtractor.apply(gray, learningRate=1.0)
                 self.update_last_frame(frame)
-        print(f"✅ 预热完成，开始监控...")
+        self.logger.info("预热完成，开始监控...")
