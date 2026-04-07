@@ -30,17 +30,19 @@ logging.basicConfig(level=logging.CRITICAL)
 class RTSPMonitorFFmpeg:
     """使用 FFmpeg pipe 的 RTSP 监控类（主流程）"""
 
-    def __init__(self, rtsp_url: str):
+    def __init__(self, rtsp_url: str, fps: int = 1, quality: int = 5):
         """
         初始化 RTSP 监控器
 
         Args:
             rtsp_url: RTSP 流地址
+            fps: 每秒抓取帧数，默认 1
+            quality: JPEG 质量 (1-31)，默认 5
         """
         self.rtsp_url = rtsp_url
 
-        # 初始化流捕获器（设置 FPS=1，每秒1帧）
-        self.stream_capture = StreamCapture(rtsp_url, fps=1, quality=5)
+        # 初始化流捕获器（使用配置的 FPS）
+        self.stream_capture = StreamCapture(rtsp_url, fps=fps, quality=quality)
 
     def connect(self) -> bool:
         """连接到 RTSP 流"""

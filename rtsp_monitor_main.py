@@ -72,11 +72,25 @@ class CaptureThread(threading.Thread):
         self.config = config
         self.frame_buffer = frame_buffer
         self.save_frames = config.getboolean("capture", "save_frames")
-        self.fps_limit = config.getint("capture", "fps")
-        self.frame_interval = 1.0 / self.fps_limit if self.fps_limit > 0 else 0
+        self.quality = config.getint("capture", "quality")
+        
+        # 支持两种抓帧模式: fps 或 interval
+        self.interval = config.getfloat("capture", "interval")
+        if self.interval > 0:
+            # 使用间隔模式（每 N 秒抓取1帧）
+            self.fps_limit = int(1.0 / self.interval) if self.interval <= 1 else 1
+            self.frame_interval = self.interval
+        else:
+            # 使用 FPS 模式（每秒 N 帧）
+            self.fps_limit = config.getint("capture", "fps")
+            self.frame_interval = 1.0 / self.fps_limit if self.fps_limit > 0 else 0
 
-        # 使用 RTSPMonitorFFmpeg（现在只需要 rtsp_url）
-        self.monitor = RTSPMonitorFFmpeg(config.get("rtsp", "url"))
+        # 使用 RTSPMonitorFFmpeg（传递 FPS 和 quality 参数）
+        self.monitor = RTSPMonitorFFmpeg(
+            config.get("rtsp", "url"),
+            fps=self.fps_limit,
+            quality=self.quality
+        )
 
         self.running = False
         self.frame_count = 0
@@ -93,7 +107,14 @@ class CaptureThread(threading.Thread):
         self.logger.info("=" * 60)
         self.logger.info("🎥 抓图线程启动")
         self.logger.info(f"RTSP URL: {self.config.get('rtsp', 'url')}")
-        self.logger.info(f"目标帧率: {self.fps_limit} FPS")
+        
+        # 显示抓帧模式
+        if self.interval > 0:
+            self.logger.info(f"抓帧模式: 间隔模式 - 每 {self.interval} 秒抓取1帧")
+        else:
+            self.logger.info(f"抓帧模式: FPS模式 - {self.fps_limit} FPS (间隔: {self.frame_interval:.2f}s)")
+        
+        self.logger.info(f"JPEG 质量: {self.quality} (1-31, 越小越好)")
         self.logger.info(f"保存每帧截图: {'是' if self.save_frames else '否'}")
         if self.save_frames:
             self.logger.info(f"截图目录: {os.path.abspath(self.frames_dir)}")
@@ -344,7 +365,10 @@ class RTSPMonitor:
         self.logger.info("=" * 60)
         self.logger.info(f"📡 RTSP URL: {self.rtsp_url}")
         self.logger.info(f"🎯 检测阈值: {self.config.get('detection', 'threshold')}")
-        self.logger.info(f"📸 抓图帧率: {self.config.get('capture', 'fps')} FPS")
+        fps = self.config.getint('capture', 'fps')
+        quality = self.config.getint('capture', 'quality')
+        self.logger.info(f"📸 抓图帧率: {fps} FPS (每 {1.0/fps if fps > 0 else 0:.2f} 秒)")
+        self.logger.info(f"🎨 JPEG 质量: {quality} (1-31, 越小质量越好)")
         save_frames = self.config.getboolean('capture', 'save_frames')
         self.logger.info(
             f"💾 保存每帧截图: {'是' if save_frames else '否'} "
