@@ -48,14 +48,15 @@ class RTSPMonitorFFmpeg:
         """连接到 RTSP 流"""
         return self.stream_capture.connect()
 
-    def get_frame(self, max_retries: int = 1):
+    def get_frame(self, max_retries: int = 1, timeout: float = 2.0):
         """
         获取一帧
 
         Args:
             max_retries: 最大重试次数
+            timeout: 超时时间（秒）
 
         Returns:
             tuple: (success, frame)
         """
-        return self.stream_capture.get_frame(max_retries)
+        return self.stream_capture.get_frame(max_retries, timeout)

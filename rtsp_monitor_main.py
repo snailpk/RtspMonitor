@@ -143,7 +143,7 @@ class CaptureThread(threading.Thread):
                         time.sleep(self.frame_interval - elapsed)
                 
                 # 直接读取一帧（FFmpeg 的 fps 过滤器已经控制了输出速率）
-                ret, frame = self.monitor.get_frame(max_retries=5)
+                ret, frame = self.monitor.get_frame(max_retries=2, timeout=2.0)
 
                 if not ret or frame is None:
                     self.error_count += 1
@@ -151,26 +151,30 @@ class CaptureThread(threading.Thread):
 
                     self.logger.warning(f"⚠️  读取失败 (连续{consecutive_errors}次)")
 
-                    # 检查 FFmpeg 进程状态
-                    if self.monitor.stream_capture.process and self.monitor.stream_capture.process.poll() is not None:
-                        self.logger.error("❌ FFmpeg 进程已退出！")
-                        self.logger.info("🔄 尝试重启 FFmpeg 进程...")
-                        time.sleep(1)
-                        if self.monitor.connect():
-                            consecutive_errors = 0
-                            self.logger.info("✅ FFmpeg 进程重启成功！")
-                        else:
-                            self.logger.error("❌ FFmpeg 进程重启失败，3秒后重试...")
-                            time.sleep(3)
+                    # 检查 FFmpeg 进程状态（每 3 次失败就检查一次）
+                    if consecutive_errors % 3 == 0:
+                        if self.monitor.stream_capture.process and self.monitor.stream_capture.process.poll() is not None:
+                            self.logger.error("❌ FFmpeg 进程已退出！")
+                            self.logger.info("🔄 立即重启 FFmpeg 进程...")
+                            time.sleep(0.5)
+                            if self.monitor.connect():
+                                consecutive_errors = 0
+                                self.logger.info("✅ FFmpeg 进程重启成功！")
+                            else:
+                                self.logger.error("❌ FFmpeg 进程重启失败，2秒后重试...")
+                                time.sleep(2)
 
+                    # 连续错误过多时快速重启
                     if consecutive_errors >= MAX_ERRORS:
-                        self.logger.error("🔄 错误过多，重启连接...")
-                        time.sleep(1)
+                        self.logger.error("🔄 错误过多，立即重启连接...")
+                        time.sleep(0.5)
                         if self.monitor.connect():
                             consecutive_errors = 0
                             self.logger.info("✅ 连接重启成功！")
+                        else:
+                            time.sleep(1)
 
-                    time.sleep(0.05)
+                    time.sleep(0.1)
                     continue
 
                 consecutive_errors = 0
@@ -355,7 +359,7 @@ class RTSPMonitor:
         self.rtsp_url = config.get("rtsp", "url")
         self.logger = get_logger(__name__)
 
-        self.frame_buffer = FrameBuffer(maxsize=10)
+        self.frame_buffer = FrameBuffer(maxsize=3)
         self.capture_thread = CaptureThread(config, self.frame_buffer)
         self.detection_thread = DetectionThread(config, self.frame_buffer)
 

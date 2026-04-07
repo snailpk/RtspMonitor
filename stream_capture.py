@@ -46,22 +46,38 @@ class StreamCapture:
             self.logger.info("正在连接 RTSP 流 (FFmpeg Pipe 模式)...")
             self.logger.debug(f"URL: {self.rtsp_url}")
 
-            # 关闭旧进程
+            # 关闭旧进程（强制关闭确保干净）
             if self.process is not None:
                 try:
-                    self.process.terminate()
-                    self.process.wait(timeout=3)
+                    if self.process.stdout:
+                        self.process.stdout.close()
+                except:
+                    pass
+                try:
+                    if self.process.stderr:
+                        self.process.stderr.close()
+                except:
+                    pass
+                try:
+                    self.process.kill()
+                    self.process.wait(timeout=2)
                 except Exception as e:
-                    self.logger.warning(f"关闭旧进程失败: {e}")
+                    try:
+                        self.process.terminate()
+                        self.process.wait(timeout=1)
+                    except:
+                        pass
+                finally:
+                    self.process = None
 
-            # FFmpeg 命令参数（使用 fps 过滤器控制输出帧率）
+            # FFmpeg 命令参数（极致低延迟 + 无缓冲）
             cmd = [
                 'ffmpeg',
                 '-rtsp_transport', 'tcp',
-                '-buffer_size', '65536',  # 64KB 小缓冲
+                '-buffer_size', '32768',  # 32KB 极小缓冲
                 '-fflags', '+discardcorrupt+genpts+igndts+nobuffer',  # 无缓冲模式
                 '-flags', 'low_delay',  # 低延迟
-                '-probesize', '16384',  # 最小探测 16KB
+                '-probesize', '8192',  # 最小探测 8KB
                 '-analyzeduration', '0',  # 不分析，立即开始
                 '-i', self.rtsp_url,
                 '-f', 'image2pipe',
@@ -84,31 +100,27 @@ class StreamCapture:
                 bufsize=0  # 无缓冲模式
             )
 
-            # 等待 FFmpeg 启动
-            time.sleep(3)
+            # 等待 FFmpeg 启动（缩短等待时间）
+            time.sleep(1.5)
 
             # 检查进程是否存活
             if self.process.poll() is not None:
                 # 进程已退出，读取错误信息
-                stdout_data, stderr_data = self.process.communicate()
+                stdout_data, stderr_data = self.process.communicate(timeout=1)
                 self.logger.error("FFmpeg 进程启动失败")
                 self.logger.error(f"返回码: {self.process.returncode}")
                 if stderr_data:
                     error_msg = stderr_data.decode('utf-8', errors='ignore')
                     self.logger.error("错误信息:")
-                    for line in error_msg.split('\n')[:10]:  # 只显示前 10 行
+                    for line in error_msg.split('\n')[:5]:
                         if line.strip():
                             self.logger.error(f"  {line}")
-                if stdout_data:
-                    output_msg = stdout_data.decode('utf-8', errors='ignore')
-                    if output_msg.strip():
-                        self.logger.debug(f"输出信息: {output_msg[:200]}")
                 return False
 
             self.logger.debug("尝试读取首帧...")
 
-            # 尝试读取第一帧
-            ret, frame = self._read_frame()
+            # 尝试读取第一帧（减少超时）
+            ret, frame = self._read_frame(timeout=2.0)
             if ret and frame is not None:
                 h, w = frame.shape[:2]
                 self.logger.info(f"连接成功！分辨率: {w}x{h}")
@@ -131,9 +143,12 @@ class StreamCapture:
             self.logger.error(f"连接异常: {type(e).__name__}: {e}", exc_info=True)
             return False
 
-    def _read_frame(self):
+    def _read_frame(self, timeout: float = 2.0):
         """
         从 FFmpeg 进程管道读取一帧（MJPEG 格式 + JPEG 帧边界检测）
+
+        Args:
+            timeout: 超时时间（秒）
 
         Returns:
             tuple: (success, frame)
@@ -143,22 +158,24 @@ class StreamCapture:
                 return False, None
 
             # 读取 JPEG 帧: 寻找 SOI (0xFFD8) 和 EOI (0xFFD9) 标记
-            return self._read_jpeg_frame()
+            return self._read_jpeg_frame(timeout)
 
         except Exception as e:
             self.logger.error(f"读取帧异常: {type(e).__name__}: {e}", exc_info=True)
             return False, None
 
-    def _read_jpeg_frame(self):
+    def _read_jpeg_frame(self, timeout: float = 2.0):
         """
         读取一帧 JPEG 数据（通过 SOI/EOI 标记 + 批量读取优化 + 容错处理）
+
+        Args:
+            timeout: 超时时间（秒），默认 2.0
 
         Returns:
             tuple: (success, frame)
         """
         try:
             start_time = time.time()
-            timeout = 5.0
 
             # 步骤 1: 寻找 SOI 标记 (0xFFD8) - 使用批量读取加速
             soi_found = False
@@ -269,18 +286,19 @@ class StreamCapture:
             self.logger.error(f"JPEG 帧读取异常: {type(e).__name__}: {e}", exc_info=True)
             return False, None
 
-    def get_frame(self, max_retries: int = 1):
+    def get_frame(self, max_retries: int = 1, timeout: float = 2.0):
         """
         获取一帧（带重试机制）
 
         Args:
             max_retries: 最大重试次数
+            timeout: 超时时间（秒）
 
         Returns:
             tuple: (success, frame)
         """
         for attempt in range(max_retries):
-            ret, frame = self._read_frame()
+            ret, frame = self._read_frame(timeout)
             if ret and frame is not None:
                 return True, frame
             time.sleep(0.05)
