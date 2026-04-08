@@ -48,10 +48,24 @@ class Logger:
             datefmt='%Y-%m-%d %H:%M:%S'
         )
 
-        # 控制台处理器
+        # 控制台处理器 - 处理Windows编码问题
         console_handler = logging.StreamHandler(sys.stdout)
         console_handler.setLevel(log_level)
         console_handler.setFormatter(formatter)
+
+        # 自定义编码过滤器，处理emoji字符
+        class SafeEncoder(logging.Filter):
+            def filter(self, record):
+                # 过滤掉无法编码的字符，如emoji
+                try:
+                    # 尝试编码为gbk
+                    record.msg.encode('gbk')
+                except UnicodeEncodeError:
+                    # 替换无法编码的字符为?
+                    record.msg = record.msg.encode('gbk', 'replace').decode('gbk')
+                return True
+
+        console_handler.addFilter(SafeEncoder())
         root_logger.addHandler(console_handler)
 
         # 文件处理器（带日志轮转）

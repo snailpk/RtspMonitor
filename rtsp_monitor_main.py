@@ -22,7 +22,7 @@ from rtsp_monitor_ffmpeg import RTSPMonitorFFmpeg
 class FrameBuffer:
     """线程安全的帧缓冲区（生产者-消费者模式）"""
 
-    def __init__(self, maxsize: int = 10):
+    def __init__(self, maxsize: int = 1):
         self.frame_queue = queue.Queue(maxsize=maxsize)
         self.dropped_frames = 0
         self.total_frames = 0
@@ -31,12 +31,10 @@ class FrameBuffer:
 
     def put_frame(self, frame) -> bool:
         try:
+            # 强制保持队列长度为1，立即丢弃旧帧
             if self.frame_queue.full():
-                try:
-                    self.frame_queue.get_nowait()
-                    self.dropped_frames += 1
-                except queue.Empty:
-                    pass
+                self.frame_queue.get_nowait()
+                self.dropped_frames += 1
 
             self.frame_queue.put_nowait(frame)
             with self.lock:
@@ -44,10 +42,10 @@ class FrameBuffer:
             return True
         except queue.Full:
             self.dropped_frames += 1
-            self.logger.warning("帧缓冲区已满，丢弃帧")
+            self.logger.debug("帧缓冲区已满，丢弃旧帧")
             return False
 
-    def get_frame(self, timeout: float = 1.0):
+    def get_frame(self, timeout: float = 0.5):
         try:
             frame = self.frame_queue.get(timeout=timeout)
             return True, frame
@@ -64,6 +62,46 @@ class FrameBuffer:
             }
 
 
+class FFmpegErrorMonitor(threading.Thread):
+    """FFmpeg 错误监控线程：持续读取 FFmpeg stderr"""
+
+    def __init__(self, stream_capture, logger):
+        super().__init__(daemon=True)
+        self.stream_capture = stream_capture
+        self.logger = logger
+        self.running = False
+
+    def run(self):
+        self.running = True
+        self.logger.info("FFmpeg 错误监控线程已启动")
+
+        while self.running:
+            try:
+                if not self.stream_capture.process or self.stream_capture.process.poll() is not None:
+                    time.sleep(0.1)
+                    continue
+
+                if self.stream_capture.process.stderr:
+                    line = self.stream_capture.process.stderr.readline()
+                    if line:
+                        line = line.decode('utf-8', errors='ignore').strip()
+                        if line:
+                            self.logger.warning(f"FFmpeg: {line}")
+                    else:
+                        time.sleep(0.01)
+                else:
+                    time.sleep(0.1)
+
+            except Exception as e:
+                self.logger.debug(f"FFmpeg 错误监控异常: {e}")
+                time.sleep(0.1)
+
+        self.logger.info("FFmpeg 错误监控线程已停止")
+
+    def stop(self):
+        self.running = False
+
+
 class CaptureThread(threading.Thread):
     """抓图线程：使用 RTSPMonitorFFmpeg 抓图"""
 
@@ -73,7 +111,7 @@ class CaptureThread(threading.Thread):
         self.frame_buffer = frame_buffer
         self.save_frames = config.getboolean("capture", "save_frames")
         self.quality = config.getint("capture", "quality")
-        
+
         # 支持两种抓帧模式: fps 或 interval
         self.interval = config.getfloat("capture", "interval")
         if self.interval > 0:
@@ -86,10 +124,12 @@ class CaptureThread(threading.Thread):
             self.frame_interval = 1.0 / self.fps_limit if self.fps_limit > 0 else 0
 
         # 使用 RTSPMonitorFFmpeg（传递 FPS 和 quality 参数）
+        transport = config.get("rtsp", "transport", "tcp").lower()
         self.monitor = RTSPMonitorFFmpeg(
             config.get("rtsp", "url"),
             fps=self.fps_limit,
-            quality=self.quality
+            quality=self.quality,
+            transport=transport
         )
 
         self.running = False
@@ -97,6 +137,9 @@ class CaptureThread(threading.Thread):
         self.error_count = 0
         self.last_frame_time = 0
         self.logger = get_logger(__name__)
+
+        # FFmpeg 错误监控线程
+        self.error_monitor = None
 
         self.frames_dir = 'frames'
         if self.save_frames and not os.path.exists(self.frames_dir):
@@ -129,9 +172,13 @@ class CaptureThread(threading.Thread):
             return
         self.logger.info("✅ RTSP 流连接成功！")
 
+        # 启动 FFmpeg 错误监控线程
+        self.error_monitor = FFmpegErrorMonitor(self.monitor.stream_capture, self.logger)
+        self.error_monitor.start()
+
         self.running = True
         consecutive_errors = 0
-        MAX_ERRORS = 10
+        MAX_ERRORS = 3  # 降低阈值，更快触发重连
 
         try:
             while self.running:
@@ -141,9 +188,9 @@ class CaptureThread(threading.Thread):
                     elapsed = current_time - self.last_frame_time
                     if elapsed < self.frame_interval:
                         time.sleep(self.frame_interval - elapsed)
-                
-                # 直接读取一帧（FFmpeg 的 fps 过滤器已经控制了输出速率）
-                ret, frame = self.monitor.get_frame(max_retries=2, timeout=2.0)
+
+                # 直接读取一帧
+                ret, frame = self.monitor.get_frame(max_retries=1, timeout=1.5)
 
                 if not ret or frame is None:
                     self.error_count += 1
@@ -151,48 +198,90 @@ class CaptureThread(threading.Thread):
 
                     self.logger.warning(f"⚠️  读取失败 (连续{consecutive_errors}次)")
 
-                    # 检查 FFmpeg 进程状态（每 3 次失败就检查一次）
-                    if consecutive_errors % 3 == 0:
-                        if self.monitor.stream_capture.process and self.monitor.stream_capture.process.poll() is not None:
-                            self.logger.error("❌ FFmpeg 进程已退出！")
-                            self.logger.info("🔄 立即重启 FFmpeg 进程...")
-                            time.sleep(0.5)
-                            if self.monitor.connect():
-                                consecutive_errors = 0
-                                self.logger.info("✅ FFmpeg 进程重启成功！")
-                            else:
-                                self.logger.error("❌ FFmpeg 进程重启失败，2秒后重试...")
-                                time.sleep(2)
+                    # 立即检查 FFmpeg 进程状态
+                    if self.monitor.stream_capture.process and self.monitor.stream_capture.process.poll() is not None:
+                        return_code = self.monitor.stream_capture.process.returncode
 
-                    # 连续错误过多时快速重启
+                        # 读取 FFmpeg 详细信息（非阻塞）
+                        stderr_output = ""
+                        try:
+                            if self.monitor.stream_capture.process.stderr:
+                                # 只读取部分错误信息，避免阻塞
+                                import select
+                                if hasattr(select, 'select'):
+                                    ready, _, _ = select.select(
+                                        [self.monitor.stream_capture.process.stderr], [], [], 0.5
+                                    )
+                                    if ready:
+                                        stderr_output = self.monitor.stream_capture.process.stderr.read(4096).decode('utf-8', errors='ignore')
+                                else:
+                                    stderr_output = self.monitor.stream_capture.process.stderr.read(4096).decode('utf-8', errors='ignore')
+                        except:
+                            pass
+
+                        # 分析错误类型
+                        if return_code == 0:
+                            self.logger.info(f"ℹ️ FFmpeg 进程正常结束（返回码 0）")
+                        else:
+                            self.logger.error(f"❌ FFmpeg 进程异常退出！返回码: {return_code}")
+                            if stderr_output:
+                                for line in stderr_output.split('\n')[:5]:  # 只显示前5行
+                                    line = line.strip()
+                                    if line:
+                                        self.logger.error(f"  {line}")
+
+                        # 判断是否是 -10054 网络错误
+                        is_network_error = False
+                        if stderr_output:
+                            if "-10054" in stderr_output or "WSAECONNRESET" in stderr_output or "Connection reset" in stderr_output:
+                                is_network_error = True
+                                self.logger.warning("🔍 检测到 -10054 网络连接重置，将启用更稳健的重连策略")
+
+                        # 使用适当的重连策略
+                        self.logger.info("🔄 立即重启 FFmpeg 进程...")
+                        if self.monitor.stream_capture.connect(fast_mode=not is_network_error):
+                            consecutive_errors = 0
+                            self.logger.info("✅ FFmpeg 进程重启成功！")
+                            # 如果是网络错误，给服务器一点时间恢复
+                            if is_network_error:
+                                time.sleep(0.5)
+                        else:
+                            self.logger.error("❌ FFmpeg 进程重启失败，0.5秒后重试...")
+                            time.sleep(0.5)
+                            continue
+
+                    # 进程还在但读取失败，也尝试快速重连
                     if consecutive_errors >= MAX_ERRORS:
-                        self.logger.error("🔄 错误过多，立即重启连接...")
-                        time.sleep(0.5)
-                        if self.monitor.connect():
+                        self.logger.warning(f"🔄 连续{consecutive_errors}次失败，强制重启连接...")
+                        # 先关闭旧连接
+                        self.monitor.stream_capture.close()
+                        time.sleep(0.3)  # 短暂等待
+                        
+                        if self.monitor.stream_capture.connect(fast_mode=True):
                             consecutive_errors = 0
                             self.logger.info("✅ 连接重启成功！")
                         else:
-                            time.sleep(1)
+                            self.logger.error("❌ 连接重启失败，0.5秒后重试...")
+                            time.sleep(0.5)
 
-                    time.sleep(0.1)
                     continue
 
                 consecutive_errors = 0
                 self.frame_count += 1
                 current_frame_time = time.time()
-                
-                # 检查是否跳秒（超过预期间隔的 1.5 倍）
+
+                # 严格检查跳秒（超过预期间隔的 1.2 倍）
                 if self.last_frame_time > 0:
                     actual_interval = current_frame_time - self.last_frame_time
-                    if actual_interval > self.frame_interval * 1.5:
+                    if actual_interval > self.frame_interval * 1.2:
                         self.logger.warning(
                             f"⚠️  跳秒检测! 预期间隔: {self.frame_interval:.2f}s, "
                             f"实际间隔: {actual_interval:.2f}s"
                         )
-                
+
                 self.last_frame_time = current_frame_time
 
-                # 输出每帧取完的日志（改为 INFO 级别，让用户清晰看到）
+                # 输出每帧取完的日志（INFO 级别）
                 h, w = frame.shape[:2]
                 frame_size_kb = frame.nbytes / 1024
                 timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
@@ -205,7 +294,7 @@ class CaptureThread(threading.Thread):
                 if self.save_frames:
                     self._save_frame_to_disk(frame)
 
-                if self.frame_count % 30 == 0:
+                if self.frame_count % 50 == 0:
                     stats = self.frame_buffer.get_stats()
                     self.logger.info(
                         f"📊 统计: 已抓 {self.frame_count} 帧, 错误 {self.error_count} 次, "
@@ -216,6 +305,10 @@ class CaptureThread(threading.Thread):
             self.logger.info("抓图线程收到停止信号")
         finally:
             self.running = False
+            # 停止 FFmpeg 错误监控线程
+            if self.error_monitor:
+                self.error_monitor.stop()
+                self.error_monitor.join(timeout=1)
             self.monitor.stream_capture.close()
             self.logger.info(f"抓图线程结束: {self.frame_count} 帧, 错误: {self.error_count} 次")
 
@@ -359,7 +452,7 @@ class RTSPMonitor:
         self.rtsp_url = config.get("rtsp", "url")
         self.logger = get_logger(__name__)
 
-        self.frame_buffer = FrameBuffer(maxsize=3)
+        self.frame_buffer = FrameBuffer(maxsize=1)
         self.capture_thread = CaptureThread(config, self.frame_buffer)
         self.detection_thread = DetectionThread(config, self.frame_buffer)
 
