@@ -80,11 +80,11 @@ class StreamCapture:
                 cmd.extend(['-max_delay', '5000000'])
 
             cmd.extend([
-                '-buffer_size', '3145728',   # 3MB 缓冲，提高抗抖动能力
+                '-buffer_size', '524288',   # 512KB 缓冲，平衡延迟和稳定性
                 '-fflags', '+discardcorrupt+genpts+igndts+nobuffer',
-                '-flags', 'low_delay',        # 低延迟
-                '-probesize', '65536',        # 探测 64KB
-                '-analyzeduration', '2000000', # 分析 2 秒，更稳定
+                '-flags', 'low_delay',       # 低延迟
+                '-probesize', '32768',       # 32KB 探测
+                '-analyzeduration', '1000000', # 分析 1 秒
                 '-i', self.rtsp_url,
                 '-f', 'image2pipe',
                 '-vcodec', 'mjpeg',
@@ -180,9 +180,9 @@ class StreamCapture:
             self.logger.error(f"读取帧异常: {type(e).__name__}: {e}", exc_info=True)
             return False, None
 
-    def _read_jpeg_frame(self, timeout: float = 3.0):
+    def _read_jpeg_frame(self, timeout: float = 1.5):
         """
-        读取一帧 JPEG 数据（通过 SOI/EOI 标记 + 批量读取优化 + 容错处理）
+        读取一帧 JPEG 数据（通过 SOI/EOI 标记 + 低延迟读取）
 
         Args:
             timeout: 超时时间（秒）
@@ -193,14 +193,11 @@ class StreamCapture:
         try:
             start_time = time.time()
 
-            # 快速刷新管道 - 清理可能的旧数据
-            self._flush_pipe()
-
             # 步骤 1: 寻找 SOI 标记 (0xFFD8)
             soi_found = False
             buffer = bytearray()
             search_buffer = bytearray()
-            max_search_iterations = 200  # 减少搜索次数，更快超时
+            max_search_iterations = 100  # 低延迟：快速超时
             search_count = 0
 
             while not soi_found:
@@ -210,19 +207,16 @@ class StreamCapture:
 
                 search_count += 1
                 if search_count > max_search_iterations:
-                    self.logger.debug("SOI 搜索次数过多，刷新管道")
-                    self._flush_pipe()
-                    search_buffer.clear()
-                    search_count = 0
-                    continue
+                    self.logger.debug("SOI 搜索次数过多，放弃当前帧")
+                    return False, None
 
-                # 单次读取较大块加速
-                chunk = self.process.stdout.read(4096)
+                # 低延迟：单次读取较大块
+                chunk = self.process.stdout.read(8192)
                 if not chunk or len(chunk) == 0:
                     if self.process.poll() is not None:
                         self.logger.debug("FFmpeg 进程已退出")
                         return False, None
-                    time.sleep(0.005)  # 更短的等待
+                    time.sleep(0.001)  # 极短等待
                     continue
 
                 search_buffer.extend(chunk)
@@ -241,8 +235,8 @@ class StreamCapture:
 
             # 步骤 2: 读取直到 EOI 标记 (0xFFD9)
             eoi_found = False
-            max_jpeg_size = 1 * 1024 * 1024  # 1MB 上限，更小的限制
-            max_read_iterations = 100  # 更快放弃
+            max_jpeg_size = 500 * 1024  # 500KB 上限，低延迟
+            max_read_iterations = 50  # 更快放弃
             read_count = 0
 
             while not eoi_found:

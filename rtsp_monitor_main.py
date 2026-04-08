@@ -178,7 +178,7 @@ class CaptureThread(threading.Thread):
 
         self.running = True
         consecutive_errors = 0
-        MAX_ERRORS = 3  # 降低阈值，更快触发重连
+        MAX_ERRORS = 2  # 更快触发重连，避免长时间无流
 
         try:
             while self.running:
@@ -230,21 +230,27 @@ class CaptureThread(threading.Thread):
                                     if line:
                                         self.logger.error(f"  {line}")
 
-                        # 判断是否是 -10054 网络错误
+                        # 判断是否是网络或解码错误
                         is_network_error = False
+                        is_decode_error = False
                         if stderr_output:
                             if "-10054" in stderr_output or "WSAECONNRESET" in stderr_output or "Connection reset" in stderr_output:
                                 is_network_error = True
                                 self.logger.warning("🔍 检测到 -10054 网络连接重置，将启用更稳健的重连策略")
+                            elif "cabac" in stderr_output or "decode" in stderr_output or "bytestream" in stderr_output:
+                                is_decode_error = True
+                                self.logger.warning("🔍 检测到 H.264 解码错误，将快速重启流")
 
                         # 使用适当的重连策略
                         self.logger.info("🔄 立即重启 FFmpeg 进程...")
-                        if self.monitor.stream_capture.connect(fast_mode=not is_network_error):
+                        if self.monitor.stream_capture.connect(fast_mode=is_decode_error):
                             consecutive_errors = 0
                             self.logger.info("✅ FFmpeg 进程重启成功！")
-                            # 如果是网络错误，给服务器一点时间恢复
+                            # 根据错误类型调整等待时间
                             if is_network_error:
                                 time.sleep(0.5)
+                            elif is_decode_error:
+                                time.sleep(0.1)
                         else:
                             self.logger.error("❌ FFmpeg 进程重启失败，0.5秒后重试...")
                             time.sleep(0.5)
@@ -378,7 +384,7 @@ class DetectionThread(threading.Thread):
 
         self.logger.info("🔥 正在预热背景模型...")
         warmup_count = 0
-        while warmup_count < 10 and self.running:
+        while warmup_count < 1 and self.running:
             ret, frame = self.frame_buffer.get_frame(timeout=2.0)
             if ret and frame is not None:
                 gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -386,7 +392,6 @@ class DetectionThread(threading.Thread):
                 self.motion_detector.bg_subtractor.apply(gray, learningRate=1.0)
                 self.motion_detector.update_last_frame(frame)
                 warmup_count += 1
-                time.sleep(0.1)
         self.logger.info("✅ 预热完成！")
 
         try:
